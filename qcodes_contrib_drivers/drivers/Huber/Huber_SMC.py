@@ -2,6 +2,7 @@ from typing import Optional, Any, Dict, List, Iterable, Tuple, Literal, Callable
 from functools import partial
 import warnings
 from qcodes.utils.helpers import create_on_off_val_mapping
+from qcodes.validators import Enum
 from qcodes.instrument import IPInstrument, InstrumentChannel, InstrumentModule
 from qcodes.parameters import Parameter
 from time import sleep
@@ -277,7 +278,7 @@ class HuberSmc(IPInstrument):
         with self._ensure_connection:
             self._send(cmd)
 
-    def ask_axval(self, ax_num, query) -> str:
+    def ask_axval(self, ax_num: int, query: str) -> str:
         if query[0] != '?':
             msg = f'Your query {query} is not a valid huber query (needs to start with ?)!'
             warnings.warn(msg)
@@ -290,6 +291,9 @@ class HuberSmc(IPInstrument):
             warnings.warn(msg)
             return ''
         return val.strip(';')
+
+    def set_axval(self, ax_num: int, setting: str, value: str) -> None:
+        self.send_raw(f'{setting}{ax_num}:{value}')
 
     def update(self) -> None:
         try:
@@ -353,29 +357,61 @@ class HuberAxis(InstrumentChannel):
                 instrument=self
             )
 
-        self.direction = Parameter(
-            'direction',
+        self.orientation = Parameter(
+            'orientation',
             get_cmd=lambda: self.orientation,
-            label='Axis direction acoording to controller',
+            label='Axis orientation (in space) acoording to controller',
             instrument=self
         )
 
         # Add status and configuration submodules
-        status = HuberAxisStatus(
+        self._status = HuberAxisStatus(
             parent=self.controller,
             name=f'ax{num}_status',
             ax_num=num
         )
 
-        ax_conf = HuberAxisConfiguration(
+        self.settings = HuberAxisConfiguration(
             parent=self.controller,
             name=f'ax{num}_configuration',
             ax_num=num,
             config=config
         )
 
-        self.add_submodule(f'ax{num}_status', status)
-        self.add_submodule(f'ax{num}_configuration', ax_conf)
+        self.add_submodule(f'ax{num}_status', self._status)
+        self.add_submodule(f'ax{num}_configuration', self.settings)
+
+        self.direction = Parameter(
+            name='direction',
+            get_cmd=self.settings.mdir,
+            get_parser=self._motor_direction_get_parser,
+            # set_cmd=lambda: self._i,
+            # self.configuration.mdir() -> True when inverted!
+            label='Axis motor direction [Normal|Inverse].',
+            instrument=self
+        )
+
+    @property
+    def inversed_direction(self):
+        return self.settings.mdir() == '1'
+
+    def set_inversed_direction(self, condition: bool):
+        if condition:
+            self.settings.mdir('1')
+        else:
+            self.settings.mdir('0')
+
+    @staticmethod
+    def _motor_direction_get_parser(value: str):
+        if value == '0':
+            return 'Normal'
+        elif value == '1':
+            return 'Inversed'
+
+    @property
+    def status(self) -> list[str]:
+        self._status.update()
+        return self._status.status_flags
 
     def stop(self) -> None:
         self.controller.send_raw(f'quit{self.num}')
@@ -394,12 +430,9 @@ class HuberAxis(InstrumentChannel):
         if not self.controller.wait_for_movement():
             return
         self.controller.set_timeout(2)
-        for submodule in self.submodules.values():
-            if type(submodule) is HuberAxisStatus:
-                submodule.update_status()
-                while 'IDLE' not in submodule.status_flags:
-                    sleep(0.1)
-                    submodule.update_status()
+        self._status.update()
+        while 'IDLE' not in self.status:
+            sleep(0.1)
         self.controller.set_timeout(self.controller.timeout)
 
     def move_rel(self, val: float) -> None:
@@ -425,6 +458,7 @@ class HuberAxisConfiguration(InstrumentModule):
 
         self._send_raw = parent.send_raw
         self._get_val = partial(parent.ask_axval, ax_num)
+        self._set_val = partial(parent.set_axval, ax_num)
         self.configuration = config
 
         self.add_parameter(
@@ -783,11 +817,12 @@ class HuberAxisConfiguration(InstrumentModule):
         )
 
         self.add_parameter(
-            'mdir',
+            name='mdir',
             initial_cache_value=config['mdir'],
             get_cmd=lambda: self._get_val('?mdir'),
-            # set_cmd=partial(self._set_val(), 'mdir'),
-            docstring='mdir|mdr[0|1]  motor rotation direction: 0:normal, 1:inverted',
+            set_cmd=lambda x: self._set_val(setting='mdir', value=x),
+            vals=Enum('0', '1'),
+            docstring='mdir|mdr{axis}:[0|1]  motor rotation direction: 0:normal, 1:inverted',
             snapshot_get=False
         )
 
@@ -926,6 +961,10 @@ class HuberAxisConfiguration(InstrumentModule):
             docstring='unit[mm|deg]  set position display unit',
             snapshot_get=False
         )
+
+    def get_settings(self) -> dict[str, str]:
+        settings = self.parameters.values()
+        return {setting.name: setting() for setting in settings}
 
 
 class HuberAxisStatus(InstrumentModule):
@@ -1075,7 +1114,7 @@ class HuberAxisStatus(InstrumentModule):
         ])
 
     def _get_flag(self, flag) -> bool:
-        self.update_status()
+        self.update()
         if flag not in AxisStatusFlags.keys():
             warnings.warn('Provided flag {flag} is not a valid status flag')
             return False
@@ -1085,7 +1124,7 @@ class HuberAxisStatus(InstrumentModule):
     def _update_sbits(self) -> None:
         self._sbits = self._get_sbits()
 
-    def update_status(self) -> None:
+    def update(self) -> None:
         self._update_sbits()
         self.statusmap.recode(self._sbits)
 
